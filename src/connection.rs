@@ -49,6 +49,21 @@ use crate::statement::{BindParam, ColumnInfo, Statement, StatementType};
 use crate::types::{LobData, LobLocator, LobValue};
 use crate::statement_cache::StatementCache;
 
+/// [edgely-patch] Hex-dump helper for connect-flow diagnostics. Emits at most
+/// `max_bytes` bytes as lowercase hex; long packets are truncated with an
+/// ellipsis so a single log line stays manageable.
+fn _edgely_hex_dump(data: &[u8], max_bytes: usize) -> String {
+    let shown = data.len().min(max_bytes);
+    let mut s = String::with_capacity(shown * 2);
+    for b in &data[..shown] {
+        s.push_str(&format!("{:02x}", b));
+    }
+    if data.len() > max_bytes {
+        s.push_str(&format!("...(+{} bytes)", data.len() - max_bytes));
+    }
+    s
+}
+
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -944,6 +959,14 @@ impl Connection {
             // Wait for response
             let response = inner.receive().await?;
 
+            // [edgely-patch] Hex-dump the connect-phase response for diagnostic
+            // purposes. See github.com/stiang/oracle-rs (future PR).
+            tracing::info!(
+                "[edgely-patch] connect_phase_one response: len={} hex={}",
+                response.len(),
+                _edgely_hex_dump(&response, 128)
+            );
+
             // Parse response packet type
             if response.len() < PACKET_HEADER_SIZE {
                 return Err(Error::PacketTooShort {
@@ -1027,6 +1050,13 @@ impl Connection {
         // Receive response
         let response = inner.receive().await?;
 
+        // [edgely-patch] Hex-dump the protocol negotiation response.
+        tracing::info!(
+            "[edgely-patch] negotiate_protocol response: len={} hex={}",
+            response.len(),
+            _edgely_hex_dump(&response, 512)
+        );
+
         // Validate packet type (at offset 4 for both SDU modes)
         if response.len() <= 4 || response[4] != PacketType::Data as u8 {
             return Err(Error::ProtocolError("Protocol negotiation failed".to_string()));
@@ -1036,7 +1066,14 @@ impl Connection {
         // The payload starts after the 8-byte header
         let payload = &response[PACKET_HEADER_SIZE..];
         let mut protocol_msg = ProtocolMessage::new();
-        protocol_msg.parse_response(payload, &mut inner.capabilities)?;
+        protocol_msg
+            .parse_response(payload, &mut inner.capabilities)
+            .map_err(|e| Error::ProtocolError(format!(
+                "[edgely-patch] Protocol parse_response failed: {} (payload len={}, hex={})",
+                e,
+                payload.len(),
+                _edgely_hex_dump(payload, 256)
+            )))?;
 
         // Update server info with banner
         if let Some(banner) = &protocol_msg.server_banner {
@@ -1062,6 +1099,13 @@ impl Connection {
 
         // Receive response
         let response = inner.receive().await?;
+
+        // [edgely-patch] Hex-dump the data-types negotiation response.
+        tracing::info!(
+            "[edgely-patch] negotiate_data_types response: len={} hex={}",
+            response.len(),
+            _edgely_hex_dump(&response, 256)
+        );
 
         // Basic validation - packet type is at offset 4 regardless of large_sdu
         if response.len() > 4 && response[4] == PacketType::Data as u8 {
@@ -1094,6 +1138,14 @@ impl Connection {
             inner.send(&request).await?;
 
             let response = inner.receive().await?;
+
+            // [edgely-patch] Hex-dump auth phase 1 response.
+            tracing::info!(
+                "[edgely-patch] auth_phase_one response: len={} hex={}",
+                response.len(),
+                _edgely_hex_dump(&response, 1024)
+            );
+
             if response.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty auth response".to_string()));
             }
@@ -1108,7 +1160,15 @@ impl Connection {
                 }
             }
 
-            auth.parse_response(&response[PACKET_HEADER_SIZE..])?;
+            let payload = &response[PACKET_HEADER_SIZE..];
+            auth.parse_response(payload).map_err(|e| {
+                Error::Protocol(format!(
+                    "[edgely-patch] auth phase 1 parse_response failed: {} (payload len={}, hex={})",
+                    e,
+                    payload.len(),
+                    _edgely_hex_dump(payload, 1024)
+                ))
+            })?;
         }
 
         // Phase two: send encrypted password
@@ -1119,6 +1179,14 @@ impl Connection {
             inner.send(&request).await?;
 
             let response = inner.receive().await?;
+
+            // [edgely-patch] Hex-dump auth phase 2 response.
+            tracing::info!(
+                "[edgely-patch] auth_phase_two response: len={} hex={}",
+                response.len(),
+                _edgely_hex_dump(&response, 1024)
+            );
+
             if response.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty auth phase two response".to_string()));
             }
@@ -1137,7 +1205,15 @@ impl Connection {
                 }
             }
 
-            auth.parse_response(&response[PACKET_HEADER_SIZE..])?;
+            let payload = &response[PACKET_HEADER_SIZE..];
+            auth.parse_response(payload).map_err(|e| {
+                Error::Protocol(format!(
+                    "[edgely-patch] auth phase 2 parse_response failed: {} (payload len={}, hex={})",
+                    e,
+                    payload.len(),
+                    _edgely_hex_dump(payload, 1024)
+                ))
+            })?;
         }
 
         // Verify authentication completed
@@ -1588,9 +1664,15 @@ impl Connection {
 
         // Parse the batch response
         let payload = &response[PACKET_HEADER_SIZE..];
+        let caps = inner.capabilities.clone();
         drop(inner); // Release lock before parsing
 
-        self.parse_batch_response(payload, batch.rows.len(), batch.options.array_dml_row_counts)
+        self.parse_batch_response(
+            payload,
+            batch.rows.len(),
+            batch.options.array_dml_row_counts,
+            &caps,
+        )
     }
 
     /// Handle MARKER packet protocol (BREAK/RESET)
@@ -1673,6 +1755,7 @@ impl Connection {
         payload: &[u8],
         batch_size: usize,
         want_row_counts: bool,
+        caps: &Capabilities,
     ) -> Result<BatchResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("Batch response too short".to_string()));
@@ -1694,7 +1777,7 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, row_count) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, _cid, row_count) = self.parse_error_info_with_rowcount(&mut buf, caps)?;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
                         return Err(Error::OracleError {
@@ -2411,6 +2494,15 @@ impl Connection {
 
         // Receive and parse response
         let response = inner.receive().await?;
+
+        // [edgely-patch] Hex-dump query response.
+        tracing::info!(
+            "[edgely-patch] execute_query response: sql={:?} len={} hex={}",
+            statement.sql(),
+            response.len(),
+            _edgely_hex_dump(&response, 2048)
+        );
+
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty query response".to_string()));
         }
@@ -2426,7 +2518,15 @@ impl Connection {
 
         // Parse the response to extract columns and rows
         let payload = &response[PACKET_HEADER_SIZE..];
-        let mut result = self.parse_query_response(payload, &inner.capabilities)?;
+        let mut result = self
+            .parse_query_response(payload, &inner.capabilities)
+            .map_err(|e| Error::Protocol(format!(
+                "[edgely-patch] parse_query_response failed: {} (sql={:?}, payload len={}, hex={})",
+                e,
+                statement.sql(),
+                payload.len(),
+                _edgely_hex_dump(payload, 2048)
+            )))?;
 
         // Check if any columns are LOB types that require defines
         let has_lob_columns = result.columns.iter().any(|col| col.is_lob());
@@ -2548,7 +2648,7 @@ impl Connection {
                             } else if pkt_type == PacketType::Data as u8 {
                                 // Got DATA packet - use this as the response (may contain error)
                                 let payload = &pkt[PACKET_HEADER_SIZE..];
-                                return self.parse_dml_response(payload);
+                                return self.parse_dml_response(payload, &inner.capabilities);
                             } else {
                                 break;
                             }
@@ -2611,7 +2711,7 @@ impl Connection {
 
         // Parse the response to extract rows affected (or error)
         let payload = &response[PACKET_HEADER_SIZE..];
-        self.parse_dml_response(payload)
+        self.parse_dml_response(payload, &inner.capabilities)
     }
 
     /// Parse query response to extract columns and rows
@@ -2656,14 +2756,31 @@ impl Connection {
 
         // Process messages until we hit end of response or run out of data
         while !end_of_response && buf.remaining() > 0 {
+            let _edgely_pos_before = payload.len() - buf.remaining();
             let msg_type = buf.read_u8()?;
+
+            // [edgely-patch] Log each message header we hit during parsing.
+            tracing::info!(
+                "[edgely-patch] parse_query msg_type=0x{:02x} at_offset={} remaining={}",
+                msg_type,
+                _edgely_pos_before,
+                buf.remaining()
+            );
 
             match msg_type {
                 // DescribeInfo (16) - column metadata
                 x if x == MessageType::DescribeInfo as u8 => {
                     // Skip chunked bytes first
-                    buf.skip_raw_bytes_chunked()?;
-                    columns = self.parse_describe_info(&mut buf, caps.ttc_field_version)?;
+                    buf.skip_raw_bytes_chunked().map_err(|e| Error::Protocol(format!(
+                        "[edgely-patch] DescribeInfo skip_raw_bytes_chunked failed at offset {}: {}",
+                        _edgely_pos_before, e
+                    )))?;
+                    columns = self
+                        .parse_describe_info(&mut buf, caps.ttc_field_version)
+                        .map_err(|e| Error::Protocol(format!(
+                            "[edgely-patch] parse_describe_info failed after msg at offset {}: {}",
+                            _edgely_pos_before, e
+                        )))?;
                 }
 
                 // RowHeader (6) - header info for rows
@@ -2689,7 +2806,7 @@ impl Connection {
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, rc) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, cid, rc) = self.parse_error_info_with_rowcount(&mut buf, caps)?;
                     cursor_id = cid;
                     row_count = rc;
                     if error_code != 0 && error_code != 1403 {
@@ -2835,7 +2952,7 @@ impl Connection {
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, rc) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, _cid, rc) = self.parse_error_info_with_rowcount(&mut buf, caps)?;
                     row_count = rc;
                     if error_code != 0 {
                         return Err(Error::OracleError {
@@ -3625,7 +3742,7 @@ impl Connection {
     }
 
     /// Parse DML response to extract rows affected
-    fn parse_dml_response(&self, payload: &[u8]) -> Result<QueryResult> {
+    fn parse_dml_response(&self, payload: &[u8], caps: &Capabilities) -> Result<QueryResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("DML response too short".to_string()));
         }
@@ -3647,7 +3764,7 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, row_count) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, cid, row_count) = self.parse_error_info_with_rowcount(&mut buf, caps)?;
                     cursor_id = cid;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
@@ -3701,7 +3818,11 @@ impl Connection {
     }
 
     /// Parse error info and return (error_code, error_msg, cursor_id, row_count)
-    fn parse_error_info_with_rowcount(&self, buf: &mut ReadBuffer) -> Result<(u32, Option<String>, u16, u64)> {
+    fn parse_error_info_with_rowcount(
+        &self,
+        buf: &mut ReadBuffer,
+        caps: &Capabilities,
+    ) -> Result<(u32, Option<String>, u16, u64)> {
         // End of call status
         let _call_status = buf.read_ub4()?;
         // End to end seq#
@@ -3786,10 +3907,16 @@ impl Connection {
         // Row count (UB8) - this is the rows affected!
         let row_count = buf.read_ub8()?;
 
-        // Fields added in Oracle Database 20c (TTC field version >= 16)
-        // We always skip these since we support Oracle 20c+
-        buf.skip_ub4()?; // sql_type
-        buf.skip_ub4()?; // server_checksum
+        // [edgely-patch] Fields added in Oracle Database 21c (TTC field
+        // version >= 16). Previously this block was unconditional which
+        // caused a buffer underflow on 19c and earlier (the reads would
+        // consume bytes that belong to the error_msg field that follows).
+        // Tested against Oracle 19c Enterprise (field version 12) and works
+        // unchanged for 21c+ (field version >= 16).
+        if caps.ttc_field_version >= crate::constants::ccap_value::FIELD_VERSION_21_1 {
+            buf.skip_ub4()?; // sql_type
+            buf.skip_ub4()?; // server_checksum
+        }
 
         // Error message
         let error_msg = if error_code != 0 {
