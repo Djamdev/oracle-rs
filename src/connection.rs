@@ -618,11 +618,24 @@ impl ConnectionInner {
         // Marker packet structure: [length][0x00][0x00][0x00][0x0c][flags][0x00][0x00] + payload
         // Payload: [0x01][0x00][marker_type]
         let payload_len = 3; // 0x01, 0x00, marker_type
-        let total_len = (PACKET_HEADER_SIZE + payload_len) as u16;
+        let total_len = (PACKET_HEADER_SIZE + payload_len) as u32;
 
-        // Header
-        buf.write_u16_be(total_len)?;
-        buf.write_u16_be(0)?; // zeros in large_sdu position
+        // Header. The length field is a 32-bit big-endian value once the
+        // server negotiates large SDU (protocol version >= 315, i.e. Oracle
+        // 12.2+), and a 16-bit length followed by a 2-byte checksum otherwise
+        // — the same rule `ConnectionInner::send` applies to data packets.
+        //
+        // Always writing the 16-bit layout encodes an 11-byte marker as
+        // 0x000B0000 on a large-SDU connection. Oracle reads that as a ~720KB
+        // packet, gives up and closes the socket — so the RESET handshake the
+        // client performs after *any* server error (ORA-00942, syntax errors,
+        // failed DDL) killed the session instead of recovering it.
+        if self.large_sdu {
+            buf.write_u32_be(total_len)?;
+        } else {
+            buf.write_u16_be(total_len as u16)?;
+            buf.write_u16_be(0)?; // checksum
+        }
         buf.write_u8(PacketType::Marker as u8)?;
         buf.write_u8(0)?; // flags
         buf.write_u16_be(0)?; // reserved
@@ -5148,10 +5161,17 @@ impl Connection {
     async fn send_marker(&self, inner: &mut ConnectionInner, marker_type: u8) -> Result<()> {
         let mut packet_buf = WriteBuffer::new();
 
-        // Build MARKER packet header
+        // Build MARKER packet header. See `ConnectionInner::send_marker` — the
+        // length field is 32-bit on large-SDU (Oracle 12.2+) connections and
+        // 16-bit + checksum otherwise; getting this wrong makes Oracle drop
+        // the connection during the post-error RESET handshake.
         let packet_len = PACKET_HEADER_SIZE + 3; // Header + 3 bytes payload
-        packet_buf.write_u16_be(packet_len as u16)?;
-        packet_buf.write_u16_be(0)?; // Checksum
+        if inner.large_sdu {
+            packet_buf.write_u32_be(packet_len as u32)?;
+        } else {
+            packet_buf.write_u16_be(packet_len as u16)?;
+            packet_buf.write_u16_be(0)?; // Checksum
+        }
         packet_buf.write_u8(PacketType::Marker as u8)?;
         packet_buf.write_u8(0)?; // Flags
         packet_buf.write_u16_be(0)?; // Header checksum
