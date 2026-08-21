@@ -49,9 +49,35 @@ impl FetchMessage {
         }
     }
 
-    /// Build the fetch request packet
-    pub fn build_request(&self, _caps: &Capabilities) -> Result<Bytes> {
+    /// Build the fetch request packet.
+    ///
+    /// Kept for callers that know the connection is not using a large SDU.
+    pub fn build_request(&self, caps: &Capabilities) -> Result<Bytes> {
+        self.build_request_with_sdu(caps, false)
+    }
+
+    /// Build the fetch request packet, framing the header for [`large_sdu`].
+    ///
+    /// Oracle 12.2+ negotiates a large SDU, where the packet header carries a
+    /// single 32-bit big-endian length instead of `u16 length + u16 checksum`.
+    /// This builder used to hardcode the 16-bit layout, so on every modern
+    /// server the FETCH went out malformed and Oracle answered with a MARKER
+    /// (0x0c) instead of row data — the same defect previously fixed in
+    /// `send_marker`. `parse_fetch_response` read the marker as zero rows, so
+    /// the result was a silently truncated result set: every query stopped at
+    /// the first prefetch batch.
+    pub fn build_request_with_sdu(
+        &self,
+        _caps: &Capabilities,
+        large_sdu: bool,
+    ) -> Result<Bytes> {
         let mut buf = WriteBuffer::new();
+
+        // Data flags live *inside* the payload, exactly as ExecuteMessage
+        // writes them. Keeping them out of the buffer and appending them to
+        // the packet separately left `packet_len` two bytes short of what was
+        // actually sent, so the server waited forever for the rest.
+        buf.write_u16_be(0)?;
 
         // Write message header
         buf.write_u8(MessageType::Function as u8)?;
@@ -74,17 +100,18 @@ impl FetchMessage {
 
         let mut packet = BytesMut::with_capacity(packet_len);
 
-        // Packet header
-        packet.put_u16(packet_len as u16); // Length
-        packet.put_u16(0); // Checksum
+        // Packet header - use a 4-byte length for large SDU
+        if large_sdu {
+            packet.put_u32(packet_len as u32);
+        } else {
+            packet.put_u16(packet_len as u16); // Length
+            packet.put_u16(0); // Checksum
+        }
         packet.put_u8(PacketType::Data as u8);
         packet.put_u8(0); // Flags
         packet.put_u16(0); // Header checksum
 
-        // Data flags (2 bytes)
-        packet.put_u16(0);
-
-        // Payload
+        // Payload (includes the data flags written above)
         packet.extend_from_slice(&payload);
 
         Ok(packet.freeze())

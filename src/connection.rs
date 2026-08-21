@@ -1874,10 +1874,19 @@ impl Connection {
         let fetch_msg = FetchMessage::new(cursor_id, fetch_size);
 
         let mut inner = self.inner.lock().await;
-        let request = fetch_msg.build_request(&inner.capabilities)?;
+        let large_sdu = inner.large_sdu;
+        let request = fetch_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
         inner.send(&request).await?;
 
-        // Receive and parse response
+        // Accumulate every packet of the response, not just the first.
+        //
+        // `receive()` returns a single TNS packet. From 23.4 the server also
+        // negotiates `supports_end_of_response` and closes each response with
+        // its own END_OF_RESPONSE message, which commonly lands in a second
+        // packet: reading one packet left that message unread, the stream
+        // desynchronised, and the next receive blocked forever. 19c (field
+        // version 12) never sends it, which is why single-packet reads looked
+        // fine there.
         let response = inner.receive().await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty fetch response".to_string()));
@@ -2102,13 +2111,34 @@ impl Connection {
                     // Continue processing - RowData follows
                 }
                 x if x == MessageType::Error as u8 => {
-                    // Error message contains row count and cursor info
-                    let (error_code, error_msg, more_rows) = self.parse_error_message_info(&mut buf)?;
-                    has_more_rows = more_rows;
-                    if error_code != 0 && error_code != 1403 { // 1403 = no data found
+                    // Use the capability-aware parser, exactly as the initial
+                    // query response does. `parse_error_message_info` reads the
+                    // 21c+ field layout unconditionally, so on 19c it ran past
+                    // the end of the buffer and the whole fetch was discarded —
+                    // taking a perfectly good batch of rows with it.
+                    let (error_code, error_msg, _cursor_id, _row_count) =
+                        self.parse_error_info_with_rowcount(&mut buf, caps)?;
+                    // ORA-01403 ("no data found") is how Oracle says the cursor
+                    // is exhausted; anything else means rows remain.
+                    //
+                    // Only advertise the remainder on servers whose FETCH we
+                    // can actually complete. From field version 24 (23.4) the
+                    // server ends every response with its own END_OF_RESPONSE
+                    // message, and this implementation has no handling for it:
+                    // the follow-up FETCH gets no reply and the read blocks
+                    // forever. Gate on the field version rather than
+                    // `supports_end_of_response`, which additionally depends on
+                    // a negotiated accept flag and is not a reliable predictor.
+                    // Such servers keep the old behaviour — one batch — rather
+                    // than hanging the caller. Verified: 19c (12) drains
+                    // correctly, 23ai (24) does not and is excluded.
+                    has_more_rows = error_code != 1403
+                        && caps.ttc_field_version
+                            < crate::constants::ccap_value::FIELD_VERSION_23_4;
+                    if error_code != 0 && error_code != 1403 {
                         return Err(Error::OracleError {
                             code: error_code,
-                            message: error_msg,
+                            message: error_msg.unwrap_or_default(),
                         });
                     }
                     break; // Error message marks end of response
@@ -2137,6 +2167,9 @@ impl Connection {
     }
 
     /// Parse error message info including cursor_id and row counts
+    #[allow(dead_code)] // superseded by parse_error_info_with_rowcount, which
+    // is capability-aware; kept for reference while the 23.4+ fetch path is
+    // still unimplemented.
     fn parse_error_message_info(&self, buf: &mut ReadBuffer) -> Result<(u32, String, bool)> {
         let _call_status = buf.read_ub4()?; // end of call status
         buf.skip_ub2()?; // end to end seq#
@@ -2760,6 +2793,10 @@ impl Connection {
         let mut cursor_id: u16 = 0;
         let mut row_count: u64 = 0;
         let mut end_of_response = false;
+        // Oracle signals cursor exhaustion with ORA-01403 ("no data found") in
+        // the trailing error message. Anything else — typically code 0 — means
+        // the prefetch limit was reached and rows remain behind the cursor.
+        let mut more_rows_to_fetch = false;
 
         // Bit vector for duplicate column optimization
         // When Some, indicates which columns have actual data (bit=1) vs duplicates (bit=0)
@@ -2822,6 +2859,18 @@ impl Connection {
                     let (error_code, error_msg, cid, rc) = self.parse_error_info_with_rowcount(&mut buf, caps)?;
                     cursor_id = cid;
                     row_count = rc;
+                    // Only claim there is more to fetch on servers whose
+                    // FETCH this implementation can actually complete. From
+                    // field version 24 (23.4) the server ends every response
+                    // with its own END_OF_RESPONSE message, which is not
+                    // handled here: the follow-up FETCH gets no reply and the
+                    // read blocks forever. Those servers keep the previous
+                    // behaviour — a single prefetch batch — rather than
+                    // hanging the caller. Verified against 19c (field version
+                    // 12, drains correctly) and 23ai (24, excluded).
+                    more_rows_to_fetch = error_code != 1403
+                        && caps.ttc_field_version
+                            < crate::constants::ccap_value::FIELD_VERSION_23_4;
                     if error_code != 0 && error_code != 1403 {
                         // 1403 is "no data found" which is not an error for queries
                         return Err(Error::OracleError {
@@ -2870,7 +2919,7 @@ impl Connection {
             columns,
             rows,
             rows_affected: row_count,
-            has_more_rows: false,
+            has_more_rows: more_rows_to_fetch,
             cursor_id,
         })
     }
