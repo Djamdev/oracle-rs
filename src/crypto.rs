@@ -241,6 +241,48 @@ pub fn generate_11g_password_hash(password: &[u8], verifier_data: &[u8]) -> Vec<
     result
 }
 
+/// Combo key length for a 12c verifier (AES-256).
+pub const KEY_LEN_12C: usize = 32;
+
+/// Combo key length for an 11g verifier (AES-192).
+pub const KEY_LEN_11G: usize = 24;
+
+/// Derive the combo key with PBKDF2 over both session key parts.
+///
+/// This is the modern derivation, used whenever the session key is not the
+/// 48 bytes the legacy MD5 mixing expects — which covers a 12c verifier and
+/// an 11g verifier on a server new enough to send PBKDF2 parameters.
+///
+/// `key_len` follows the *verifier*, not the session key: 32 bytes (AES-256)
+/// for 12c, 24 bytes (AES-192) for 11g. It sets both how much of each part is
+/// mixed in and how long the resulting key is.
+pub fn generate_pbkdf2_combo_key(
+    session_key_part_a: &[u8],
+    session_key_part_b: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    key_len: usize,
+) -> Result<Vec<u8>> {
+    if session_key_part_a.len() < key_len || session_key_part_b.len() < key_len {
+        return Err(Error::Protocol(format!(
+            "session key too short for combo key: need {} bytes, got server part {} and client part {}",
+            key_len,
+            session_key_part_a.len(),
+            session_key_part_b.len()
+        )));
+    }
+
+    // Combine parts: client_key[..key_len] + server_key[..key_len], as an
+    // upper-case hex string.
+    let combined = format!(
+        "{}{}",
+        hex::encode_upper(&session_key_part_b[..key_len]),
+        hex::encode_upper(&session_key_part_a[..key_len])
+    );
+
+    Ok(pbkdf2_derive(combined.as_bytes(), salt, iterations, key_len))
+}
+
 /// Generate the combo key for Oracle 12c authentication
 ///
 /// The combo key is derived from the client and server session key parts
@@ -251,21 +293,55 @@ pub fn generate_12c_combo_key(
     salt: &[u8],
     iterations: u32,
 ) -> Vec<u8> {
-    // Combine parts: client_key[:32] + server_key[:32] as hex string
-    let combined = format!(
-        "{}{}",
-        hex::encode_upper(&session_key_part_b[..32]),
-        hex::encode_upper(&session_key_part_a[..32])
-    );
-
-    // Derive combo key using PBKDF2
-    pbkdf2_derive(combined.as_bytes(), salt, iterations, 32)
+    generate_pbkdf2_combo_key(
+        session_key_part_a,
+        session_key_part_b,
+        salt,
+        iterations,
+        KEY_LEN_12C,
+    )
+    .expect("12c session key parts are always at least 32 bytes")
 }
+
+/// Number of bytes `generate_11g_combo_key` reads from each session key part.
+///
+/// The 11g algorithm mixes bytes 16..40, so both parts must be at least this
+/// long. A server that negotiates an 11g verifier normally returns a 48-byte
+/// AUTH_SESSKEY.
+pub const COMBO_KEY_11G_MIN_LEN: usize = 40;
+
+/// Number of bytes `generate_12c_combo_key` takes from each session key part.
+pub const COMBO_KEY_12C_PART_LEN: usize = 32;
+
+/// Session key length that selects the legacy MD5 mixing for an 11g verifier.
+pub const LEGACY_11G_SESSION_KEY_LEN: usize = 48;
+
+/// Length of an AES-256 key, and so of a PBKDF2-derived combo key.
+pub const AES_256_KEY_LEN: usize = 32;
 
 /// Generate the combo key for Oracle 11g authentication
 ///
 /// The combo key is derived by XORing session key parts and hashing with MD5.
-pub fn generate_11g_combo_key(session_key_part_a: &[u8], session_key_part_b: &[u8]) -> Vec<u8> {
+///
+/// Both parts must be at least [`COMBO_KEY_11G_MIN_LEN`] bytes. Returning an
+/// error rather than indexing blindly matters: this runs behind an FFI
+/// boundary, where a panic surfaces to the caller as an opaque
+/// "index out of bounds" with no clue which server or which key was short.
+pub fn generate_11g_combo_key(
+    session_key_part_a: &[u8],
+    session_key_part_b: &[u8],
+) -> Result<Vec<u8>> {
+    if session_key_part_a.len() < COMBO_KEY_11G_MIN_LEN
+        || session_key_part_b.len() < COMBO_KEY_11G_MIN_LEN
+    {
+        return Err(Error::Protocol(format!(
+            "11g session key too short: need {} bytes, got server part {} and client part {}. The server negotiated an 11g verifier but returned an AUTH_SESSKEY of an unexpected size, and offered no PBKDF2 parameters to use the modern derivation instead.",
+            COMBO_KEY_11G_MIN_LEN,
+            session_key_part_a.len(),
+            session_key_part_b.len()
+        )));
+    }
+
     // XOR bytes 16-40 from both parts
     let mut xored = vec![0u8; 24];
     for i in 0..24 {
@@ -285,7 +361,7 @@ pub fn generate_11g_combo_key(session_key_part_a: &[u8], session_key_part_b: &[u
     let mut result = part1.to_vec();
     result.extend_from_slice(&part2);
     result.truncate(24);
-    result
+    Ok(result)
 }
 
 /// Generate a random salt for password encryption
@@ -397,8 +473,49 @@ mod tests {
         let part_a = [0x11u8; 48];
         let part_b = [0x22u8; 48];
 
-        let combo = generate_11g_combo_key(&part_a, &part_b);
+        let combo = generate_11g_combo_key(&part_a, &part_b).unwrap();
         assert_eq!(combo.len(), 24);
+    }
+
+    #[test]
+    fn combo_key_11g_rejects_short_parts_instead_of_panicking() {
+        // A 19c+ server negotiating an 11g verifier sends a 32-byte
+        // AUTH_SESSKEY. The legacy mixing reads bytes 16..40, so it must
+        // report that rather than index out of bounds behind the FFI.
+        let part_a = [0x11u8; 32];
+        let part_b = [0x22u8; 32];
+
+        let err = generate_11g_combo_key(&part_a, &part_b).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("32"), "error should name the actual length: {msg}");
+    }
+
+    #[test]
+    fn combo_key_11g_pbkdf2_yields_an_aes_192_key() {
+        // A 19c+ server with an 11g verifier sends a 32-byte session key and
+        // PBKDF2 parameters. The key length follows the verifier (24 bytes,
+        // AES-192), NOT the 32-byte session key — deriving 32 bytes here and
+        // encrypting with AES-256 is rejected by the server.
+        let part_a = [0x11u8; 32];
+        let part_b = [0x22u8; 32];
+        let salt = [0x33u8; 16];
+
+        let combo =
+            generate_pbkdf2_combo_key(&part_a, &part_b, &salt, 3, KEY_LEN_11G).unwrap();
+        assert_eq!(combo.len(), KEY_LEN_11G);
+    }
+
+    #[test]
+    fn combo_key_12c_accepts_exactly_32_byte_parts() {
+        // The PBKDF2 derivation slices [..32], so a 32-byte session key part
+        // — what a modern server sends with an 11g verifier — is the minimum
+        // that must work.
+        let part_a = [0x11u8; COMBO_KEY_12C_PART_LEN];
+        let part_b = [0x22u8; COMBO_KEY_12C_PART_LEN];
+        let salt = [0x33u8; 16];
+
+        let combo = generate_12c_combo_key(&part_a, &part_b, &salt, 3);
+        assert_eq!(combo.len(), AES_256_KEY_LEN);
     }
 
     #[test]

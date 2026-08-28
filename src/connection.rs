@@ -2562,10 +2562,20 @@ impl Connection {
             return self.parse_error_response(payload);
         }
 
-        // Parse the response to extract columns and rows
+        // Parse the response to extract columns and rows.
+        //
+        // A statement replayed from the cache carries the columns Oracle
+        // described on its first execution, and Oracle does NOT resend that
+        // describe block on a re-execute. Feeding those columns *into* the
+        // parser is what makes the rows decodable: without them the decoder
+        // has no layout, yields zero rows, and the caller sees an empty
+        // result for a response that is full of data. Restoring the columns
+        // onto the result afterwards (see `execute_query`) fixes the column
+        // list but comes too late for the rows.
         let payload = &response[PACKET_HEADER_SIZE..];
+        let known_columns = statement.columns().to_vec();
         let mut result = self
-            .parse_query_response(payload, &inner.capabilities)
+            .parse_query_response_with_columns(payload, &inner.capabilities, &known_columns)
             .map_err(|e| Error::Protocol(format!(
                 "[edgely-patch] parse_query_response failed: {} (sql={:?}, payload len={}, hex={})",
                 e,

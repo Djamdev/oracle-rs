@@ -19,9 +19,16 @@ use crate::constants::{auth_mode, verifier_type, FunctionCode, MessageType, Pack
 use crate::crypto::{
     decrypt_cbc_192, decrypt_cbc_256, encrypt_cbc_192, encrypt_cbc_256_pkcs7,
     generate_11g_combo_key, generate_11g_password_hash, generate_12c_combo_key,
-    generate_12c_password_hash, generate_salt, generate_session_key_part, pbkdf2_derive,
+    generate_12c_password_hash, generate_pbkdf2_combo_key, generate_salt,
+    generate_session_key_part, pbkdf2_derive, AES_256_KEY_LEN, KEY_LEN_11G,
+    LEGACY_11G_SESSION_KEY_LEN,
 };
 use crate::error::{Error, Result};
+
+/// Hex length of the client AUTH_SESSKEY for a 32-byte session key.
+const CLIENT_KEY_HEX_LEN_DEFAULT: usize = 64;
+/// Hex length of the client AUTH_SESSKEY for the 48-byte legacy 11g key.
+const CLIENT_KEY_HEX_LEN_LEGACY_11G: usize = 96;
 use crate::packet::PacketHeader;
 
 /// Session data received from server during authentication
@@ -91,6 +98,10 @@ pub struct AuthMessage {
     session_data: SessionData,
     /// Verifier type (11g or 12c)
     verifier_type: u32,
+    /// Hex length to truncate the client session key to when sending
+    /// AUTH_SESSKEY. Follows the *session key size*, not the verifier: 96 for
+    /// the 48-byte legacy 11g key, 64 for everything else.
+    client_key_hex_len: usize,
     /// Combo key for encryption (derived from session keys)
     combo_key: Option<Vec<u8>>,
     /// Client session key (generated)
@@ -138,6 +149,7 @@ impl AuthMessage {
             auth_mode: auth_mode::LOGON,
             session_data: SessionData::default(),
             verifier_type: 0,
+            client_key_hex_len: CLIENT_KEY_HEX_LEN_DEFAULT,
             combo_key: None,
             client_session_key: None,
             terminal: std::env::var("TERM").unwrap_or_else(|_| "unknown".to_string()),
@@ -339,10 +351,15 @@ impl AuthMessage {
             buf.write_bytes_with_length(Some(user_bytes))?;
         }
 
-        // Session key (client portion)
+        // Session key (client portion).
+        //
+        // The truncation length follows the session key size, not the verifier
+        // type: only the 48-byte legacy 11g key sends 96 hex chars. An 11g
+        // verifier on a modern server has a 32-byte key and must send 64 —
+        // keying this off the verifier type sent 96 and the server rejected
+        // the request with a bare MARKER.
         let session_key_hex = hex::encode_upper(session_key);
-        // For 12c, use first 64 chars; for 11g, use first 96 chars
-        let key_len = if self.verifier_type == verifier_type::V12C { 64 } else { 96 };
+        let key_len = self.client_key_hex_len;
         let key_str = &session_key_hex[..key_len.min(session_key_hex.len())];
         self.write_key_value(&mut buf, "AUTH_SESSKEY", key_str, 1)?;
 
@@ -546,6 +563,8 @@ impl AuthMessage {
         let sder_count = self.session_data.auth_pbkdf2_sder_count
             .ok_or_else(|| Error::AuthenticationFailed("Missing AUTH_PBKDF2_SDER_COUNT".to_string()))?;
 
+        self.client_key_hex_len = CLIENT_KEY_HEX_LEN_DEFAULT;
+
         self.combo_key = Some(generate_12c_combo_key(
             &session_key_part_a,
             &session_key_part_b,
@@ -571,11 +590,45 @@ impl AuthMessage {
         let encrypted_client_key = encrypt_cbc_192(&password_hash, &session_key_part_b)?;
         self.client_session_key = Some(encrypted_client_key);
 
-        // Generate combo key
-        self.combo_key = Some(generate_11g_combo_key(
-            &session_key_part_a,
-            &session_key_part_b,
-        ));
+        // Combo key derivation follows the *session key length*, matching the
+        // reference implementation: 48 bytes means the legacy MD5 mixing, any
+        // other size means the PBKDF2 derivation.
+        //
+        // A 19c+ server still negotiating an 11g verifier — an account whose
+        // password predates 12c, so PASSWORD_VERSIONS lists 11G but not 12C —
+        // sends a 32-byte AUTH_SESSKEY plus PBKDF2 parameters and expects the
+        // modern derivation. The key length stays 24 (AES-192) because that
+        // follows the verifier, not the session key.
+        self.client_key_hex_len = if session_key_part_a.len() == LEGACY_11G_SESSION_KEY_LEN {
+            CLIENT_KEY_HEX_LEN_LEGACY_11G
+        } else {
+            CLIENT_KEY_HEX_LEN_DEFAULT
+        };
+
+        self.combo_key = Some(if session_key_part_a.len() == LEGACY_11G_SESSION_KEY_LEN {
+            generate_11g_combo_key(&session_key_part_a, &session_key_part_b)?
+        } else {
+            let salt_hex = self.session_data.auth_pbkdf2_csk_salt.as_ref().ok_or_else(|| {
+                Error::AuthenticationFailed(format!(
+                    "11g verifier with a {}-byte AUTH_SESSKEY needs AUTH_PBKDF2_CSK_SALT, which the server did not send (verifier_type=0x{:04x})",
+                    server_key.len(),
+                    self.verifier_type
+                ))
+            })?;
+            let salt_bytes = hex::decode(salt_hex)
+                .map_err(|e| Error::Protocol(format!("Invalid CSK_SALT hex: {}", e)))?;
+            let iterations = self.session_data.auth_pbkdf2_sder_count.ok_or_else(|| {
+                Error::AuthenticationFailed("Missing AUTH_PBKDF2_SDER_COUNT".to_string())
+            })?;
+
+            generate_pbkdf2_combo_key(
+                &session_key_part_a,
+                &session_key_part_b,
+                &salt_bytes,
+                iterations,
+                KEY_LEN_11G,
+            )?
+        });
 
         Ok(())
     }
@@ -590,8 +643,11 @@ impl AuthMessage {
         let mut password_with_salt = salt.to_vec();
         password_with_salt.extend_from_slice(&self.password);
 
-        // Encrypt based on verifier type (uses PKCS7 padding)
-        let encrypted = if self.verifier_type == verifier_type::V12C {
+        // Pick the cipher from the combo key we actually derived, not from the
+        // verifier type: an 11g verifier on a modern server yields a 32-byte
+        // PBKDF2 combo key, which is an AES-256 key. Keying this off the
+        // verifier type would hand a 32-byte key to AES-192 and fail.
+        let encrypted = if combo_key.len() == AES_256_KEY_LEN {
             encrypt_cbc_256_pkcs7(combo_key, &password_with_salt)?
         } else {
             encrypt_cbc_192(combo_key, &password_with_salt)?
@@ -641,7 +697,7 @@ impl AuthMessage {
             let encrypted = hex::decode(response)
                 .map_err(|e| Error::Protocol(format!("Invalid server response hex: {}", e)))?;
 
-            let decrypted = if self.verifier_type == verifier_type::V12C {
+            let decrypted = if combo_key.len() == AES_256_KEY_LEN {
                 decrypt_cbc_256(combo_key, &encrypted)?
             } else {
                 decrypt_cbc_192(combo_key, &encrypted)?
